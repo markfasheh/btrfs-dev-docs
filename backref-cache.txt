@@ -1,0 +1,124 @@
+ Backref Cache
+===============
+
+Required reading: backreferences.txt
+
+Relocation uses a backref cache to avoid replicating tree walks. The
+cache represents tree blocks in a structure which replicates their
+relationships on disk.
+
+
+ Backref tree structure
+------------------------
+
+
+struct backref_node {
+        struct rb_node rb_node;
+
+	u64 bytenr;
+
+	/* list of upper level blocks reference this block */
+	struct list_head upper;
+
+	/* list of child blocks in the cache */
+	struct list_head lower;
+
+	/* NULL if this node is not tree root */
+	struct btrfs_root *root;
+
+	...
+};
+
+Each backref_node structure has an rb_node which is used to organize
+the nodes in a tree sorted by disk location (bytenr).
+
+The more interesting portions of the backref node are the 'upper' and
+'lower' list_heads which serve to link backref nodes with blocks that
+reference them, and blocks they reference respectively.
+
+Nodes are linked with the following self-explanatory structure:
+
+struct backref_edge {
+	struct list_head list[2];
+	struct backref_node *node[2];
+};
+
+#define LOWER	0
+#define UPPER	1
+
+
+ Building a backref tree
+-------------------------
+
+The overwhelming majority of this process happens in the function
+build_backref_tree(). The comment and function signature give a
+reasonable overview of what's happening inside:
+
+/*
+ * build backref tree for a given tree block. root of the backref tree
+ * corresponds the tree block, leaves of the backref tree correspond
+ * roots of b-trees that reference the tree block.
+ *
+ * the basic idea of this function is check backrefs of a given block
+ * to find upper level blocks that reference the block, and then check
+ * backrefs of these upper level blocks recursively. the recursion stop
+ * when tree root is reached or backrefs for the block is cached.
+ *
+ * NOTE: if we find backrefs for a block are cached, we know backrefs
+ * for all upper level blocks that directly/indirectly reference the
+ * block are also cached.
+ */
+ struct backref_node *build_backref_tree(struct reloc_control *rc,
+					struct btrfs_key *node_key,
+					int level, u64 bytenr)
+
+Internally the meat of the function is structured as a loop which
+processes backref_nodes in a list which is initially filled with the
+input node. For each node on the list, we look up it's references. For
+tree refs that means we have to walk the referenced tree to find all
+refs. However we get to it, we look up each parent node in the
+cache. If the parent node is in the cache, we connect our current node
+and continue to the next item on our list. If the parent node is not
+in the cache, we create it and add it to our list for further
+processing in the main loop.
+
+The backref cache also maintains a list of nodes which have been
+deemed 'useless' by the relocation code - typically tree roots. These
+are cleaned up at the end of the function.
+
+ Changes to the backref cache for qgroups
+------------------------------------------
+
+The qgroups accounting code does not need to change. We replace all
+the places where qgroups goes on a root finding mission
+(find_all_roots) with a lookup in the backref cache. Since the backref
+cache does not store data extent references, we have to replicate the
+intial ref tree walk to find blocks that reference an extent.
+
+Once we have a backref node, we can walk it to find the referencing
+roots. Those roots are added into an 'owner cache' which consists of a
+per-node sparse bitmap. To find roots, qgroups then walks the owner
+cache for each node.
+
+Qgroups keeps two backref caches - one from our old stable fs tree and
+at accounting time it builds one from the fs tree being
+committed. When we are done accounting, we can destroy the old tree
+and replace it with the one we just built. That way any extents that
+have already been walked don't have to be read again.
+
+In build_backref_tree() we have the following primary changes:
+
+- We divorce the relocation struct from the backref cache structure.
+
+- We allow the backref cache tree searches to optionally search the
+  commit root.
+
+Most of the difficulty in adapting the backref cache is in validating
+it's use for qgroups.
+
+Locking the backref cache is tricky. We use a wait bit on the backref
+node. As we walk the tree, new nodes are inserted in a locked
+state. Other threads will see this bit and pause their processing
+until it is cleared. Once we have completed processing of the node, it
+is marked complete and unlocked. The node is never locked again and is
+read-only at that point.
